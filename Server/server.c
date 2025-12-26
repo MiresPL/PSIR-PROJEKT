@@ -16,6 +16,8 @@
 #define ALP_ASSIGN     0x02
 #define ALP_DATA       0x03
 #define ALP_ACK        0x04
+#define ALP_REQUEST_DATA 0x05
+#define ALP_RESPONSE_DATA 0x06
 
 #define ALP_MAX_PAYLOAD 256
 
@@ -60,6 +62,7 @@ typedef struct {
 
 typedef struct {
     char alphabet[64];
+    char draw_symbols[64];
     char axiom[MAX_STR];
     int iterations;
     int angle;
@@ -102,6 +105,9 @@ int load_lsystem(const char *filename, LSystem *ls) {
             ls->rules[ls->rule_count].symbol = sym;
             strcpy(ls->rules[ls->rule_count].replacement, rhs);
             ls->rule_count++;
+        }
+        else if (strncmp(line, "draw:", 5) == 0) {
+            sscanf(line + 5, "%[^\n]", ls->draw_symbols);
         }
     }
 
@@ -171,12 +177,111 @@ void send_assign(LSystem *ls, int sockfd, Node *node, int region_id) {
 
     buf[pos++] = alp_crc(buf, pos);
 
-    sendto(sockfd, buf, pos, 0,
-           (struct sockaddr *)&node->addr,
-           sizeof(node->addr));
+    sendto(sockfd, buf, pos, 0, (struct sockaddr *) &node->addr, sizeof(node->addr));
+    printf("ASSIGN -> node %d region %d (%d,%d %dx%d)\n", node->node_id, region_id, rx, ry, region_w, region_h);
+}
 
-    printf("ASSIGN -> node %d region %d (%d,%d %dx%d)\n",
-           node->node_id, region_id, rx, ry, region_w, region_h);
+/* ===================== DATA SENDER ===================== */
+
+void send_data(int sockfd, Node *node, uint8_t region_id, uint8_t x, uint8_t y, uint8_t value) {
+    uint8_t buf[32];
+    int pos = 0;
+
+    buf[pos++] = ALP_SYSTEM_ID;
+    buf[pos++] = ALP_DATA;
+    buf[pos++] = node->node_id;
+    buf[pos++] = region_id;
+
+    buf[pos++] = 0;
+    buf[pos++] = 3;
+
+    buf[pos++] = x;
+    buf[pos++] = y;
+    buf[pos++] = value;
+
+    buf[pos++] = alp_crc(buf, pos);
+
+    sendto(sockfd, buf, pos, 0, (struct sockaddr *) &node->addr, sizeof(node->addr));
+}
+
+/* ===================== REQUEST DATA SENDER ===================== */
+
+void send_request_data(int sockfd, Node *node, uint8_t region_id) {
+    uint8_t buf[16];
+    int pos = 0;
+
+    buf[pos++] = ALP_SYSTEM_ID;
+    buf[pos++] = ALP_REQUEST_DATA;
+    buf[pos++] = node->node_id;
+    buf[pos++] = region_id;
+
+    buf[pos++] = 0;
+    buf[pos++] = 0;
+
+    buf[pos++] = alp_crc(buf, pos);
+
+    sendto(sockfd, buf, pos, 0, (struct sockaddr *) &node->addr, sizeof(node->addr));
+    printf("REQUEST_DATA -> node %d (region %d)\n", node->node_id, region_id);
+}
+
+
+/* ===================== REGION FINDER ===================== */
+
+int get_region_for_point(int x, int y) {
+    int region_w = GRID_WIDTH / REGIONS_X;
+    int region_h = GRID_HEIGHT / REGIONS_Y;
+
+    int rx = x / region_w;
+    int ry = y / region_h;
+
+    if (rx < 0 || rx >= REGIONS_X || ry < 0 || ry >= REGIONS_Y) return -1;
+    return ry * REGIONS_X + rx;
+}
+
+/* ===================== DRAW SYMBOL CHECKER ===================== */
+
+int is_draw_symbol(LSystem *ls, char c) {
+    for (int i = 0; ls->draw_symbols[i]; i++) {
+        if (ls->draw_symbols[i] == c)
+            return 1;
+    }
+    return 0;
+}
+
+/* ===================== TURTLE SIMULATION ===================== */
+
+void turtle_distribute(int sockfd, LSystem *ls, const char *word) {
+    int x = GRID_WIDTH / 2;
+    int y = GRID_HEIGHT / 2;
+    int dir = 0;
+
+    int region = get_region_for_point(x, y);
+
+    if (region >= 0) send_data(sockfd, &nodes[region], region, x, y, '#');
+
+    for (int i = 0; word[i]; i++) {
+        char c = word[i];
+
+        if (is_draw_symbol(ls, c)) {
+            if (dir == 0) y--;
+            else if (dir == 90) x++;
+            else if (dir == 180) y++;
+            else if (dir == 270) x--;
+
+            if (x < 0 || x >= GRID_WIDTH || y < 0 || y >= GRID_HEIGHT) continue;
+
+            region = get_region_for_point(x, y);
+            if (region >= 0 && nodes[region].active) send_data(sockfd, &nodes[region], region, x, y, '#');
+        } else if (c == '+') {
+            dir = (dir + ls->angle) % 360;
+        } else if (c == '-') {
+            dir = (dir - ls->angle + 360) % 360;
+        }
+    }
+
+    printf("Turtle distribution finished\n");
+    printf("Requesting data from nodes...\n");
+    for (int i = 0; i < node_count; i++) send_request_data(sockfd, &nodes[i], i);
 }
 
 
@@ -195,6 +300,7 @@ int main() {
 
     printf("=== L-SYSTEM LOADED ===\n");
     printf("Alphabet: %s\n", ls.alphabet);
+    printf("Draw symbols: %s\n", ls.draw_symbols);
     printf("Axiom: %s\n", ls.axiom);
     printf("Iterations: %d\n", ls.iterations);
     printf("Angle: %d\n", ls.angle);
@@ -226,8 +332,7 @@ int main() {
     printf("Server listening on port %d\n", PORT);
 
     while (1) {
-        int n = recvfrom(sockfd, buffer, sizeof(buffer), 0,
-                         (struct sockaddr *)&cliaddr, &len);
+        int n = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *) &cliaddr, &len);
 
         if (n <= 0) continue;
 
@@ -243,6 +348,22 @@ int main() {
 
             send_assign(&ls, sockfd, node, node_count);
             node_count++;
+
+            if (node_count == MAX_NODES) {
+                printf("All nodes registered – starting turtle\n");
+                turtle_distribute(sockfd, &ls, final_word);
+            }
+        }
+
+        if (buffer[1] == ALP_RESPONSE_DATA) {
+            uint8_t node_id = buffer[2];
+            uint8_t region  = buffer[3];
+            uint8_t len     = buffer[5];
+
+            printf("RESPONSE_DATA from node %d (region %d), payload %d bytes\n",
+                node_id, region, len);
+
+            /* Na razie tylko debug – payload przyjdzie później */
         }
     }
 }
