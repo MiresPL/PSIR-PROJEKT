@@ -22,7 +22,7 @@
 #define MAX_REGION       32
 #define SERVER_IP        "192.168.56.104" 
 #define SERVER_PORT      8000
-#define NODE_ID          4  // <--- WAŻNE: Zmieniaj to (1, 2, 3, 4) przed kompilacją kolejnych węzłów!
+#define NODE_ID          4  // <--- PAMIĘTAJ: Zmieniaj to (1, 2, 3, 4) przed kompilacją!
 
 char grid[MAX_REGION][MAX_REGION];
 int rx, ry, rw, rh, g_angle;
@@ -59,18 +59,27 @@ void send_handover(int idx, double x, double y, double angle) {
     printf(">>> Handover sent! Index: %d, Pos: %.2f,%.2f\n", idx, x, y);
 }
 
-// Funkcja Rysująca (Smart Turtle)
+// Funkcja Rysująca (Smart Turtle) - WERSJA POPRAWIONA (CIĄGŁA)
 void draw_turtle_smart(const char *word, int start_idx, double start_x, double start_y, double start_angle) {
     double cur_x = start_x;
     double cur_y = start_y;
     double angle_rad = start_angle; 
 
-    // Zabezpieczenie przed błędami float na krawędziach - "wciąganie" do środka
+    // 1. Zabezpieczenie krawędzi (wciąganie floatów)
     if(cur_x < rx) cur_x = rx + 0.01;
     if(cur_x >= rx+rw) cur_x = rx + rw - 0.01;
     if(cur_y < ry) cur_y = ry + 0.01;
     if(cur_y >= ry+rh) cur_y = ry + rh - 0.01;
 
+    // 2. RYSOWANIE PUNKTU STARTOWEGO (To naprawia dziury!)
+    int start_ix = (int)round(cur_x);
+    int start_iy = (int)round(cur_y);
+    // Sprawdzamy czy punkt startowy jest u nas
+    if (start_ix >= rx && start_ix < rx + rw && start_iy >= ry && start_iy < ry + rh) {
+        grid[start_iy - ry][start_ix - rx] = '#';
+    }
+
+    // 3. Pętla ruchu
     for (int i = start_idx; word[i]; i++) {
         if (word[i] == 'F') {
             double next_x = cur_x + cos(angle_rad);
@@ -86,7 +95,7 @@ void draw_turtle_smart(const char *word, int start_idx, double start_x, double s
                 return; // Przerywamy pracę
             }
 
-            // Rysowanie
+            // Rysowanie kolejnego punktu
             grid[iy - ry][ix - rx] = '#';
             cur_x = next_x;
             cur_y = next_y;
