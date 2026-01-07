@@ -6,17 +6,18 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/time.h>
 #include <stdint.h>
-#include <math.h>
 
-/* ================= KONFIGURACJA PROTOKOŁU ALP ================= */
-#define ALP_SYSTEM_ID    0xA5
-#define ALP_REGISTER     0x01
-#define ALP_ASSIGN       0x02
-#define ALP_DATA         0x03
-#define ALP_REQUEST_DATA 0x05
-#define ALP_RESPONSE_DATA 0x06
-#define ALP_HANDOVER     0x07
+/* ================= KONFIGURACJA PROTOKOŁU ALP (Binary & Reliable) ================= */
+#define ALP_VERSION      1
+#define MSG_REGISTER     0x1
+#define MSG_ASSIGN       0x2
+#define MSG_DATA         0x3
+#define MSG_ACK          0x4
+#define MSG_REQUEST      0x5
+#define MSG_RESPONSE     0x6
+#define MSG_HANDOVER     0x7
 
 #define PORT 8000
 #define MAX_STR    8192
@@ -25,6 +26,8 @@
 #define GRID_HEIGHT 40
 #define MAX_NODES   4 
 #define REGIONS_X   2
+#define TIMEOUT_MS  200
+#define MAX_RETRIES 3
 
 /* ================= STRUKTURY DANYCH ================= */
 typedef struct {
@@ -35,7 +38,7 @@ typedef struct {
 
 Node nodes[MAX_NODES];
 int node_count = 0;
-char global_grid[GRID_HEIGHT][GRID_WIDTH]; // Płótno do finalnego obrazka
+char global_grid[GRID_HEIGHT][GRID_WIDTH]; 
 
 typedef struct {
     char symbol;
@@ -52,30 +55,70 @@ typedef struct {
     int rule_count;
 } LSystem;
 
-/* ================= FUNKCJE POMOCNICZE ================= */
+/* ================= MATEMATYKA ================= */
+int my_floor(double x) {
+    int i = (int)x;
+    if (x < 0 && x != i) return i - 1;
+    return i;
+}
+
+int get_region_for_point(double x, double y) {
+    int region_w = GRID_WIDTH / REGIONS_X;
+    int region_h = GRID_HEIGHT / REGIONS_X;
+    int rx = my_floor(x / region_w);
+    int ry = my_floor(y / region_h);
+    
+    if (rx < 0 || rx >= REGIONS_X || ry < 0 || ry >= REGIONS_X) return -1;
+    return ry * REGIONS_X + rx;
+}
+
+/* ================= WARSTWA SIECIOWA (ALP) ================= */
 uint8_t alp_crc(uint8_t *buf, int len) {
     uint8_t crc = 0;
     for (int i = 0; i < len; i++) crc += buf[i];
     return crc;
 }
 
-// Funkcja obliczająca, w którym regionie jest punkt (x,y)
-// Używamy floor(), aby poprawnie obsługiwać krawędzie i liczby ujemne
-int get_region_for_point(double x, double y) {
-    int region_w = GRID_WIDTH / REGIONS_X; // 20
-    int region_h = GRID_HEIGHT / REGIONS_X; // 20
-    int rx = (int)floor(x / region_w);
-    int ry = (int)floor(y / region_h);
-    
-    // Jeśli punkt wyszedł poza siatkę 2x2, zwracamy -1 (błąd/koniec)
-    if (rx < 0 || rx >= REGIONS_X || ry < 0 || ry >= REGIONS_X) return -1;
-    return ry * REGIONS_X + rx;
+void pack_header(uint8_t *buf, int type, int node_id, int payload_len) {
+    buf[0] = (ALP_VERSION << 4) | (type & 0x0F);
+    buf[1] = (uint8_t)node_id;
+    buf[2] = (payload_len >> 8) & 0xFF;
+    buf[3] = payload_len & 0xFF;
 }
 
-/* ================= L-SYSTEM (LOGIKA) ================= */
+void send_ack(int sockfd, struct sockaddr_in *dest) {
+    uint8_t buf[5];
+    pack_header(buf, MSG_ACK, 0, 0);
+    buf[4] = alp_crc(buf, 4);
+    sendto(sockfd, buf, 5, 0, (struct sockaddr *)dest, sizeof(*dest));
+}
+
+void send_reliable(int sockfd, uint8_t *buf, int len, struct sockaddr_in *dest) {
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = TIMEOUT_MS * 1000;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+
+    struct sockaddr_in from;
+    socklen_t from_len = sizeof(from);
+    uint8_t ack_buf[16];
+
+    for(int i=0; i<MAX_RETRIES; i++) {
+        sendto(sockfd, buf, len, 0, (struct sockaddr *)dest, sizeof(*dest));
+        int n = recvfrom(sockfd, ack_buf, sizeof(ack_buf), 0, (struct sockaddr *)&from, &from_len);
+        if (n > 0) {
+            int type = ack_buf[0] & 0x0F;
+            if (type == MSG_ACK) return;
+        }
+        printf("WARN: No ACK. Retrying (%d/%d)...\n", i+1, MAX_RETRIES);
+    }
+    printf("ERROR: Transmission failed (Node unreachable).\n");
+}
+
+/* ================= FUNKCJE APLIKACJI ================= */
 int load_lsystem(const char *filename, LSystem *ls) {
     FILE *f = fopen(filename, "r");
-    if (!f) { perror("Cannot open input.txt"); return -1; }
+    if (!f) { perror("Input error"); return -1; }
     char line[256]; ls->rule_count = 0;
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == '\n') continue;
@@ -113,61 +156,47 @@ void generate_lsystem(LSystem *ls, char *output) {
     strcpy(output, current);
 }
 
-/* ================= FUNKCJE SIECIOWE ================= */
 void send_assign(LSystem *ls, int sockfd, Node *node, int region_id) {
-    uint8_t buf[32]; int pos = 0;
+    uint8_t buf[32]; 
+    pack_header(buf, MSG_ASSIGN, node->node_id, 6);
+    int pos = 4;
     int rx = (region_id % 2) * 20;
     int ry = (region_id / 2) * 20;
 
-    buf[pos++] = ALP_SYSTEM_ID; buf[pos++] = ALP_ASSIGN;
-    buf[pos++] = node->node_id; buf[pos++] = region_id;
-    buf[pos++] = 0; buf[pos++] = 5; 
     buf[pos++] = (uint8_t)rx; buf[pos++] = (uint8_t)ry;
     buf[pos++] = 20; buf[pos++] = 20; 
     buf[pos++] = (uint8_t)ls->angle;
+    
     buf[pos++] = alp_crc(buf, pos);
-    sendto(sockfd, buf, pos, 0, (struct sockaddr *)&node->addr, sizeof(node->addr));
-    printf("ASSIGN -> node %d region %d (Starts at %d,%d)\n", node->node_id, region_id, rx, ry);
+    send_reliable(sockfd, buf, pos, &node->addr);
+    printf("ASSIGN -> Node %d (Region %d,%d)\n", node->node_id, rx, ry);
 }
 
-// Funkcja wysyłająca zadanie do konkretnego węzła
 void send_work_chunk(int sockfd, int node_idx, const char *word, int start_idx, double x, double y, double angle) {
     uint8_t buf[MAX_STR + 64];
     int word_len = strlen(word);
-    int pos = 0;
-
-    buf[pos++] = ALP_SYSTEM_ID;
-    buf[pos++] = ALP_DATA;
-    buf[pos++] = nodes[node_idx].node_id;
-    buf[pos++] = 0; 
-    
-    // Payload: index(2) + x(8) + y(8) + angle(8) + word
     int payload_len = 2 + 8 + 8 + 8 + word_len;
-    buf[pos++] = (payload_len >> 8) & 0xFF;
-    buf[pos++] = payload_len & 0xFF;
+    
+    pack_header(buf, MSG_DATA, nodes[node_idx].node_id, payload_len);
+    int pos = 4;
 
-    // Metadane
     buf[pos++] = (start_idx >> 8) & 0xFF;
     buf[pos++] = start_idx & 0xFF;
     memcpy(&buf[pos], &x, 8); pos += 8;
     memcpy(&buf[pos], &y, 8); pos += 8;
     memcpy(&buf[pos], &angle, 8); pos += 8;
-
-    // Słowo L-Systemu
-    memcpy(&buf[pos], word, word_len);
-    pos += word_len;
+    memcpy(&buf[pos], word, word_len); pos += word_len;
 
     buf[pos++] = alp_crc(buf, pos);
-
-    sendto(sockfd, buf, pos, 0, (struct sockaddr *)&nodes[node_idx].addr, sizeof(nodes[node_idx].addr));
-    printf("ROUTER: Sent task to Node %d (Start Idx: %d, Pos: %.1f,%.1f)\n", nodes[node_idx].node_id, start_idx, x, y);
+    send_reliable(sockfd, buf, pos, &nodes[node_idx].addr);
+    printf("ROUTER: Task sent to Node %d (Pos %.1f, %.1f)\n", nodes[node_idx].node_id, x, y);
 }
 
 /* ================= MAIN ================= */
 int main() {
     LSystem ls;
     char final_word[MAX_STR];
-    memset(global_grid, '.', sizeof(global_grid)); // Czyścimy płótno
+    memset(global_grid, '.', sizeof(global_grid));
 
     if (load_lsystem("input.txt", &ls) != 0) return 1;
     generate_lsystem(&ls, final_word);
@@ -183,111 +212,119 @@ int main() {
         perror("Bind failed"); return 1;
     }
 
-    printf("=== SERVER STARTED ===\n");
-    printf("L-System Word Length: %lu\n", strlen(final_word));
+    printf("=== SERVER STARTED (Reliable ALP) ===\n");
     printf("Waiting for %d nodes to register...\n", MAX_NODES);
 
-    // 1. FAZA REJESTRACJI
+    struct timeval tv_zero = {0, 0};
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv_zero, sizeof tv_zero);
+
     while (node_count < MAX_NODES) {
         socklen_t len = sizeof(cliaddr);
         uint8_t buffer[256];
         int n = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&cliaddr, &len);
-        if (n > 0 && buffer[1] == ALP_REGISTER) {
-            int exists = 0;
-            for(int i=0; i<node_count; i++) if(nodes[i].node_id == buffer[2]) exists=1;
-            
-            if(!exists) {
-                nodes[node_count].node_id = buffer[2];
-                nodes[node_count].addr = cliaddr;
-                nodes[node_count].active = 1;
-                send_assign(&ls, sockfd, &nodes[node_count], node_count);
-                node_count++;
-                printf("Node %d registered.\n", buffer[2]);
+        if (n > 0) {
+            int type = buffer[0] & 0x0F;
+            if (type == MSG_REGISTER) {
+                uint8_t nid = buffer[1];
+                int exists = 0;
+                for(int i=0; i<node_count; i++) if(nodes[i].node_id == nid) exists=1;
+                if(!exists) {
+                    nodes[node_count].node_id = nid;
+                    nodes[node_count].addr = cliaddr;
+                    nodes[node_count].active = 1;
+                    send_ack(sockfd, &cliaddr);
+                    send_assign(&ls, sockfd, &nodes[node_count], node_count);
+                    node_count++;
+                    printf("Node %d registered.\n", nid);
+                }
             }
         }
     }
 
-    // 2. START SYMULACJI (Wybieramy węzeł środkowy)
-    // Startujemy w punkcie (20.0, 20.0). Matematycznie należy on do Regionu 3 (Node 4).
     double start_x = 20.0, start_y = 20.0;
     int start_node_idx = get_region_for_point(start_x, start_y);
-    
     printf("\n>>> STARTING SIMULATION <<<\n");
     if(start_node_idx >= 0)
         send_work_chunk(sockfd, start_node_idx, final_word, 0, start_x, start_y, 0.0);
 
-    // 3. FAZA ROUTINGU (HANDOVER)
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv_zero, sizeof tv_zero);
+
     while (1) {
         socklen_t len = sizeof(cliaddr);
         uint8_t buffer[1024];
         int n = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&cliaddr, &len);
         if (n <= 0) continue;
 
-        if (buffer[1] == ALP_HANDOVER) {
-            int idx = (buffer[6] << 8) | buffer[7];
+        int type = buffer[0] & 0x0F;
+
+        if (type == MSG_HANDOVER) {
+            send_ack(sockfd, &cliaddr);
+
+            // === POPRAWKA TUTAJ: Indeksy przesunięte o 2 w lewo! ===
+            // Header (4 bajty) -> Payload zaczyna się od buffer[4]
+            int idx = (buffer[4] << 8) | buffer[5];
             double h_x, h_y, h_ang;
-            memcpy(&h_x, &buffer[8], 8);
-            memcpy(&h_y, &buffer[16], 8);
-            memcpy(&h_ang, &buffer[24], 8);
+            memcpy(&h_x, &buffer[6], 8);
+            memcpy(&h_y, &buffer[14], 8);
+            memcpy(&h_ang, &buffer[22], 8);
 
-            printf("HANDOVER from Node (Idx %d): Turtle at (%.2f, %.2f)\n", idx, h_x, h_y);
+            printf("HANDOVER (Idx %d) at (%.2f, %.2f)\n", idx, h_x, h_y);
 
-            // Sprawdź czy koniec słowa
             if (idx >= strlen(final_word)) {
-                printf("DRAWING FINISHED! Proceeding to data collection...\n");
+                printf("DRAWING FINISHED!\n");
                 break; 
             }
 
             int next_node = get_region_for_point(h_x, h_y);
             if (next_node == -1) {
-                printf("Turtle escaped the grid boundaries! Stopping simulation.\n");
+                printf("Turtle escaped!\n");
                 break;
             }
-
             send_work_chunk(sockfd, next_node, final_word, idx, h_x, h_y, h_ang);
         }
     }
 
-    // 4. FAZA ZBIERANIA DANYCH
-    printf("\n>>> REQUESTING FINAL IMAGES FROM NODES <<<\n");
+    printf("\n>>> REQUESTING FINAL IMAGES <<<\n");
     for (int i = 0; i < node_count; i++) {
-        uint8_t req[8] = {ALP_SYSTEM_ID, ALP_REQUEST_DATA, nodes[i].node_id, 0, 0, 0, 0, 0};
-        req[7] = alp_crc(req, 7);
-        sendto(sockfd, req, 8, 0, (struct sockaddr *)&nodes[i].addr, sizeof(nodes[i].addr));
+        uint8_t buf[16];
+        pack_header(buf, MSG_REQUEST, nodes[i].node_id, 0);
+        buf[4] = alp_crc(buf, 4);
+        send_reliable(sockfd, buf, 5, &nodes[i].addr);
     }
 
-    // Czekamy na odpowiedzi i sklejamy obraz
-    printf("Collecting data chunks... (Wait 2s)\n");
-    for(int k=0; k<20; k++) { // Prosta pętla czekająca (20 * 0.1s = 2s)
+    printf("Collecting data...\n");
+    struct timeval tv_poll = {0, 100000};
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv_poll, sizeof tv_poll);
+
+    int received_count = 0;
+    while(received_count < 60) { 
         socklen_t len = sizeof(cliaddr);
         uint8_t buf[2048];
-        // MSG_DONTWAIT pozwala nie blokować pętli, jeśli nic nie ma
-        int n = recvfrom(sockfd, buf, sizeof(buf), MSG_DONTWAIT, (struct sockaddr *)&cliaddr, &len);
-        
-        if(n > 0 && buf[1] == ALP_RESPONSE_DATA) {
-            uint8_t node_id = buf[2];
-            int region_idx = -1;
-            // Znajdź indeks regionu dla tego węzła
-            for(int i=0; i<node_count; i++) if(nodes[i].node_id == node_id) region_idx = i;
-            
-            if(region_idx != -1) {
-                 int start_x = (region_idx % 2) * 20;
-                 int start_y = (region_idx / 2) * 20;
-                 int ptr = 6; // Offset danych w pakiecie
-                 
-                 printf("Received data from Node %d. Merging into global grid...\n", node_id);
-                 
-                 for(int y=0; y<20; y++) {
-                    for(int x=0; x<20; x++) {
-                        global_grid[start_y + y][start_x + x] = buf[ptr++];
-                    }
-                 }
+        int n = recvfrom(sockfd, buf, sizeof(buf), 0, (struct sockaddr *)&cliaddr, &len);
+        if(n > 0) {
+            int type = buf[0] & 0x0F;
+            if (type == MSG_RESPONSE) {
+                send_ack(sockfd, &cliaddr); 
+                uint8_t node_id = buf[1];
+                int region_idx = -1;
+                for(int i=0; i<node_count; i++) if(nodes[i].node_id == node_id) region_idx = i;
+                if(region_idx != -1) {
+                     int start_x = (region_idx % 2) * 20;
+                     int start_y = (region_idx / 2) * 20;
+                     int ptr = 4;
+                     printf("Merged data from Node %d.\n", node_id);
+                     for(int y=0; y<20; y++) {
+                        for(int x=0; x<20; x++) {
+                            char val = buf[ptr++];
+                            if(val == '#') global_grid[start_y + y][start_x + x] = '#';
+                        }
+                     }
+                }
             }
         }
-        usleep(100000); // 0.1s delay
+        received_count++;
     }
 
-    // 5. WYŚWIETLENIE FINALNEGO WYNIKU
     printf("\n================ FINAL RESULT ================\n");
     for(int y = 0; y < GRID_HEIGHT; y++) {
         for(int x = 0; x < GRID_WIDTH; x++) {
@@ -296,6 +333,5 @@ int main() {
         printf("\n");
     }
     printf("==============================================\n");
-
     return 0;
 }
