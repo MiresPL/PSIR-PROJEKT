@@ -1,7 +1,6 @@
 #include <ZsutEthernet.h>
 #include <ZsutEthernetUdp.h>
 #include <ZsutFeatures.h>
-#include <math.h>
 
 #define ALP_VERSION  1
 #define MSG_REGISTER 0x1
@@ -18,7 +17,7 @@
 // !!! IP TWOJEGO SERVERA (UPEWNIJ SIE ZE DOBRE) !!!
 #define SERVER_IP ZsutIPAddress(192,168,89,10) 
 // Ustaw odpowiednie ID dla każdego pliku hex (1, 2, 3, 4)
-#define NODE_ID 1
+#define NODE_ID 4
 // ============================================
 
 #define SERVER_PORT 8000
@@ -114,39 +113,52 @@ void loop(){
             int ca = sa;
             
             int cmds_len = len - 6;
+            int steps_done = 0;
 
             for(int i=0; i<cmds_len; i++){
                 char cmd = buf[11+i];
                 if(cmd=='F'){ 
-                    // POPRAWKA: round() zamiast rzutowania (int)
-                    // Naprawia błędy np. 19.999 -> 20
                     int ix = (int)round(cx); 
                     int iy = (int)round(cy);
                     
+                    bool inside = false;
                     if(configured) {
-                        int local_x = ix - rx;
-                        int local_y = iy - ry;
-
-                        if(local_x >= 0 && local_x < rw && local_y >= 0 && local_y < rh) {
-                              grid[local_y][local_x] = '#';
-                        }
+                         int local_x = ix - rx;
+                         int local_y = iy - ry;
+                         if(local_x >= 0 && local_x < rw && local_y >= 0 && local_y < rh) {
+                             inside = true;
+                         }
                     }
 
+                    if(!inside && steps_done > 0) { 
+                        break; 
+                    }
+
+                    if(inside) {
+                        grid[(int)round(cy) - ry][(int)round(cx) - rx] = '#';
+                    }
+
+                    // Ruch żółwia
                     double rad = (double)ca * 3.14159265 / 180.0;
                     cx += move_step * cos(rad); 
                     cy += move_step * sin(rad); 
+                    
+                    steps_done++;
                 }
                 else if(cmd=='+') { 
                     ca = (ca + (int)turn_angle) % 360;
+                    steps_done++;
                 }
                 else if(cmd=='-') { 
                     ca = ca - (int)turn_angle;
                     if(ca < 0) ca += 360;
+                    steps_done++;
                 }
             }
 
-            // Odsyłamy HANDOVER jako potwierdzenie
-            uint8_t r[32]; pack_header(r, MSG_HANDOVER, seq, 6);
+            uint8_t r[32]; 
+            pack_header(r, MSG_HANDOVER, seq, 7);
+            
             int16_t nx=(int16_t)(cx*100); 
             int16_t ny=(int16_t)(cy*100); 
             int16_t na=(int16_t)ca;
@@ -154,9 +166,12 @@ void loop(){
             r[5]=(nx>>8)&0xFF; r[6]=nx&0xFF;
             r[7]=(ny>>8)&0xFF; r[8]=ny&0xFF;
             r[9]=(na>>8)&0xFF; r[10]=na&0xFF;
-            r[11]=alp_crc(r,11);
             
-            Udp.beginPacket(SERVER_IP, SERVER_PORT); Udp.write(r,12); Udp.endPacket();
+            r[11] = (uint8_t)steps_done;
+            
+            r[12]=alp_crc(r,12);
+            
+            Udp.beginPacket(SERVER_IP, SERVER_PORT); Udp.write(r,13); Udp.endPacket();
         }
         else if(type == MSG_REQ_COORDS){
             Serial.println("REQ: Origin Coords requested.");

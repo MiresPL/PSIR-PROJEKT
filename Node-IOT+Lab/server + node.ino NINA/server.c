@@ -32,8 +32,6 @@
 #define MSG_REQ_COORDS  0x8
 #define MSG_RESP_COORDS 0x9
 
-#define ORIGIN_NODE_ID 1
-
 typedef struct {
     uint8_t id;             
     struct sockaddr_in addr;
@@ -129,10 +127,13 @@ int send_reliable(int sock, int node_idx, uint8_t *packet, int packet_len,
 // --- LOGIKA APLIKACJI ---
 
 int get_node_index(double x, double y) {
-    int col = (int)(x / 20.0);
-    int row = (int)(y / 20.0);
+    int col = (int)((x + 0.5) / NODE_GRID_SIZE);
+    int row = (int)((y + 0.5) / NODE_GRID_SIZE);
+    
+    // Zabezpieczenia granic (bez zmian)
     if (col < 0) col = 0; if (col > 1) col = 1;
     if (row < 0) row = 0; if (row > 1) row = 1;
+    
     return row * 2 + col;
 }
 
@@ -317,12 +318,13 @@ void run_simulation(int sock) {
             int16_t nx = (buf[5] << 8) | buf[6];
             int16_t ny = (buf[7] << 8) | buf[8];
             int16_t na = (buf[9] << 8) | buf[10];
+            uint8_t processed_count = buf[11];
 
             cur_x = nx / 100.0;
             cur_y = ny / 100.0;
             cur_angle = (double)na;
             
-            cursor += chunk_len;
+            cursor += processed_count;
             steps_done++;
             if(steps_done % 10 == 0) { printf("\rStep %d/%d", steps_done, total_len); fflush(stdout); }
         } else {
@@ -419,11 +421,11 @@ int main() {
         int idx = nodes[i].id - 1;
         
         // Obliczamy parametry dla noda
-        uint8_t rx = (idx % 2) * 20;
-        uint8_t ry = (idx / 2) * 20;
+        uint8_t rx = (idx % 2) * NODE_GRID_SIZE;
+        uint8_t ry = (idx / 2) * NODE_GRID_SIZE;
         
         msg[5] = rx; msg[6] = ry; 
-        msg[7] = 20; msg[8] = 20; 
+        msg[7] = NODE_GRID_SIZE; msg[8] = NODE_GRID_SIZE; 
         
         int16_t ang = (int16_t)config.angle_deg;
         int16_t stp = (int16_t)(config.step * 100); 
