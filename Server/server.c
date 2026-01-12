@@ -9,7 +9,7 @@
 #include <sys/time.h>
 #include <stdint.h>
 
-/* ================= KONFIGURACJA PROTOKOŁU ALP (Binary & Reliable) ================= */
+// CONFIG
 #define ALP_VERSION      1
 #define MSG_REGISTER     0x1
 #define MSG_ASSIGN       0x2
@@ -20,318 +20,262 @@
 #define MSG_HANDOVER     0x7
 
 #define PORT 8000
-#define MAX_STR    8192
-#define MAX_RULES  16
+#define MAX_STR    100000
 #define GRID_WIDTH  40
 #define GRID_HEIGHT 40
+#define NODE_WIDTH  20
+#define NODE_HEIGHT 20
 #define MAX_NODES   4 
-#define REGIONS_X   2
-#define TIMEOUT_MS  200
-#define MAX_RETRIES 3
+#define MY_PI 3.1415926535
 
-/* ================= STRUKTURY DANYCH ================= */
 typedef struct {
     uint8_t node_id;
     struct sockaddr_in addr;
-    int active;
+    int rx, ry; 
 } Node;
 
 Node nodes[MAX_NODES];
 int node_count = 0;
 char global_grid[GRID_HEIGHT][GRID_WIDTH]; 
 
-typedef struct {
-    char symbol;
-    char replacement[MAX_STR];
-} Rule;
+// L-System Structs
+typedef struct { char symbol; char replacement[MAX_STR]; } Rule;
+typedef struct { char axiom[MAX_STR]; int iterations; int angle; Rule rules[16]; int rule_count; } LSystem;
 
-typedef struct {
-    char alphabet[64];
-    char draw_symbols[64];
-    char axiom[MAX_STR];
-    int iterations;
-    int angle;
-    Rule rules[MAX_RULES];
-    int rule_count;
-} LSystem;
-
-/* ================= MATEMATYKA ================= */
-int my_floor(double x) {
-    int i = (int)x;
-    if (x < 0 && x != i) return i - 1;
-    return i;
+// --- MANUAL MATH ---
+double normalize_angle(double x) {
+    while (x > MY_PI) x -= 2 * MY_PI;
+    while (x < -MY_PI) x += 2 * MY_PI;
+    return x;
 }
-
-int get_region_for_point(double x, double y) {
-    int region_w = GRID_WIDTH / REGIONS_X;
-    int region_h = GRID_HEIGHT / REGIONS_X;
-    int rx = my_floor(x / region_w);
-    int ry = my_floor(y / region_h);
-    
-    if (rx < 0 || rx >= REGIONS_X || ry < 0 || ry >= REGIONS_X) return -1;
-    return ry * REGIONS_X + rx;
+double my_sin(double x) {
+    x = normalize_angle(x);
+    double x2 = x * x;
+    double res = x;
+    res += -x * x2 / 6.0;
+    res += x * x2 * x2 / 120.0;
+    return res;
 }
+double my_cos(double x) { return my_sin(x + MY_PI / 2.0); }
 
-/* ================= WARSTWA SIECIOWA (ALP) ================= */
+// --- NETWORK ---
 uint8_t alp_crc(uint8_t *buf, int len) {
     uint8_t crc = 0;
     for (int i = 0; i < len; i++) crc += buf[i];
     return crc;
 }
-
 void pack_header(uint8_t *buf, int type, int node_id, int payload_len) {
     buf[0] = (ALP_VERSION << 4) | (type & 0x0F);
     buf[1] = (uint8_t)node_id;
     buf[2] = (payload_len >> 8) & 0xFF;
     buf[3] = payload_len & 0xFF;
 }
-
 void send_ack(int sockfd, struct sockaddr_in *dest) {
-    uint8_t buf[5];
-    pack_header(buf, MSG_ACK, 0, 0);
-    buf[4] = alp_crc(buf, 4);
+    uint8_t buf[5]; pack_header(buf, MSG_ACK, 0, 0); buf[4] = alp_crc(buf, 4);
     sendto(sockfd, buf, 5, 0, (struct sockaddr *)dest, sizeof(*dest));
 }
 
-void send_reliable(int sockfd, uint8_t *buf, int len, struct sockaddr_in *dest) {
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = TIMEOUT_MS * 1000;
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
-
-    struct sockaddr_in from;
-    socklen_t from_len = sizeof(from);
-    uint8_t ack_buf[16];
-
-    for(int i=0; i<MAX_RETRIES; i++) {
-        sendto(sockfd, buf, len, 0, (struct sockaddr *)dest, sizeof(*dest));
-        int n = recvfrom(sockfd, ack_buf, sizeof(ack_buf), 0, (struct sockaddr *)&from, &from_len);
-        if (n > 0) {
-            int type = ack_buf[0] & 0x0F;
-            if (type == MSG_ACK) return;
-        }
-        printf("WARN: No ACK. Retrying (%d/%d)...\n", i+1, MAX_RETRIES);
-    }
-    printf("ERROR: Transmission failed (Node unreachable).\n");
+int get_node_idx(int x, int y) {
+    if(x<0) x=0; if(x>=GRID_WIDTH) x=GRID_WIDTH-1;
+    if(y<0) y=0; if(y>=GRID_HEIGHT) y=GRID_HEIGHT-1;
+    int col = x / NODE_WIDTH;
+    int row = y / NODE_HEIGHT;
+    int target = (row * 2) + col + 1;
+    for(int i=0; i<node_count; i++) if(nodes[i].node_id == target) return i;
+    return -1;
 }
 
-/* ================= FUNKCJE APLIKACJI ================= */
-int load_lsystem(const char *filename, LSystem *ls) {
-    FILE *f = fopen(filename, "r");
-    if (!f) { perror("Input error"); return -1; }
+// --- L-SYSTEM ---
+int load_lsystem(const char *f, LSystem *ls) {
+    FILE *fp = fopen(f, "r");
+    if(!fp) return -1;
     char line[256]; ls->rule_count = 0;
-    while (fgets(line, sizeof(line), f)) {
-        if (line[0] == '#' || line[0] == '\n') continue;
-        if (strncmp(line, "alphabet:", 9) == 0) sscanf(line + 9, "%[^\n]", ls->alphabet);
-        else if (strncmp(line, "axiom:", 6) == 0) sscanf(line + 6, "%s", ls->axiom);
-        else if (strncmp(line, "iterations:", 11) == 0) ls->iterations = atoi(line + 11);
-        else if (strncmp(line, "angle:", 6) == 0) ls->angle = atoi(line + 6);
-        else if (strncmp(line, "rule:", 5) == 0) {
-            char sym; char rhs[MAX_STR]; sscanf(line + 5, " %c=%s", &sym, rhs);
-            ls->rules[ls->rule_count].symbol = sym;
-            strcpy(ls->rules[ls->rule_count].replacement, rhs); ls->rule_count++;
-        } else if (strncmp(line, "draw:", 5) == 0) sscanf(line + 5, "%s", ls->draw_symbols);
-    }
-    fclose(f); return 0;
-}
-
-void generate_lsystem(LSystem *ls, char *output) {
-    char current[MAX_STR]; char next[MAX_STR];
-    strcpy(current, ls->axiom);
-    for (int it = 0; it < ls->iterations; it++) {
-        next[0] = '\0';
-        for (int i = 0; current[i]; i++) {
-            int replaced = 0;
-            for (int r = 0; r < ls->rule_count; r++) {
-                if (current[i] == ls->rules[r].symbol) {
-                    strcat(next, ls->rules[r].replacement); replaced = 1; break;
-                }
-            }
-            if (!replaced) {
-                int len = strlen(next); next[len] = current[i]; next[len + 1] = '\0';
-            }
+    while(fgets(line, sizeof(line), fp)) {
+        if(line[0]=='#') continue;
+        if(strncmp(line, "axiom:", 6)==0) sscanf(line+6, "%s", ls->axiom);
+        else if(strncmp(line, "angle:", 6)==0) ls->angle = atoi(line+6);
+        else if(strncmp(line, "iterations:", 11)==0) ls->iterations = atoi(line+11);
+        else if(strncmp(line, "rule:", 5)==0) {
+            char k; char v[MAX_STR]; sscanf(line+5, " %c=%s", &k, v);
+            ls->rules[ls->rule_count].symbol=k; strcpy(ls->rules[ls->rule_count].replacement, v);
+            ls->rules[ls->rule_count++].replacement[strlen(v)]=0;
         }
-        strcpy(current, next);
     }
-    strcpy(output, current);
+    fclose(fp); return 0;
+}
+void generate_lsystem(LSystem *ls, char *out) {
+    char cur[MAX_STR], next[MAX_STR];
+    strcpy(cur, ls->axiom);
+    for(int i=0; i<ls->iterations; i++) {
+        next[0]=0;
+        for(int j=0; cur[j]; j++) {
+            int r = -1;
+            for(int k=0; k<ls->rule_count; k++) if(cur[j]==ls->rules[k].symbol) r=k;
+            if(r!=-1) strcat(next, ls->rules[r].replacement);
+            else { int l=strlen(next); next[l]=cur[j]; next[l+1]=0; }
+        }
+        strcpy(cur, next);
+    }
+    strcpy(out, cur);
 }
 
-void send_assign(LSystem *ls, int sockfd, Node *node, int region_id) {
-    uint8_t buf[32]; 
-    pack_header(buf, MSG_ASSIGN, node->node_id, 6);
-    int pos = 4;
-    int rx = (region_id % 2) * 20;
-    int ry = (region_id / 2) * 20;
-
-    buf[pos++] = (uint8_t)rx; buf[pos++] = (uint8_t)ry;
-    buf[pos++] = 20; buf[pos++] = 20; 
-    buf[pos++] = (uint8_t)ls->angle;
+// --- MAIN ---
+int main(int argc, char *argv[]) {
+    if(argc<2) { printf("Usage: %s <file>\n", argv[0]); return 1; }
     
-    buf[pos++] = alp_crc(buf, pos);
-    send_reliable(sockfd, buf, pos, &node->addr);
-    printf("ASSIGN -> Node %d (Region %d,%d)\n", node->node_id, rx, ry);
-}
-
-void send_work_chunk(int sockfd, int node_idx, const char *word, int start_idx, double x, double y, double angle) {
-    uint8_t buf[MAX_STR + 64];
-    int word_len = strlen(word);
-    int payload_len = 2 + 8 + 8 + 8 + word_len;
-    
-    pack_header(buf, MSG_DATA, nodes[node_idx].node_id, payload_len);
-    int pos = 4;
-
-    buf[pos++] = (start_idx >> 8) & 0xFF;
-    buf[pos++] = start_idx & 0xFF;
-    memcpy(&buf[pos], &x, 8); pos += 8;
-    memcpy(&buf[pos], &y, 8); pos += 8;
-    memcpy(&buf[pos], &angle, 8); pos += 8;
-    memcpy(&buf[pos], word, word_len); pos += word_len;
-
-    buf[pos++] = alp_crc(buf, pos);
-    send_reliable(sockfd, buf, pos, &nodes[node_idx].addr);
-    printf("ROUTER: Task sent to Node %d (Pos %.1f, %.1f)\n", nodes[node_idx].node_id, x, y);
-}
-
-/* ================= MAIN ================= */
-int main() {
-    LSystem ls;
-    char final_word[MAX_STR];
+    LSystem ls; char final_str[MAX_STR];
     memset(global_grid, '.', sizeof(global_grid));
-
-    if (load_lsystem("input.txt", &ls) != 0) return 1;
-    generate_lsystem(&ls, final_word);
+    load_lsystem(argv[1], &ls);
+    generate_lsystem(&ls, final_str);
+    printf("L-System: %lu chars\n", strlen(final_str));
 
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in servaddr, cliaddr;
-    memset(&servaddr, 0, sizeof(servaddr));
-    servaddr.sin_family = AF_INET;
-    servaddr.sin_addr.s_addr = INADDR_ANY;
-    servaddr.sin_port = htons(PORT);
-    
-    if (bind(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
-        perror("Bind failed"); return 1;
+    struct sockaddr_in serv, cli;
+    memset(&serv, 0, sizeof(serv));
+    serv.sin_family = AF_INET; serv.sin_addr.s_addr = INADDR_ANY; serv.sin_port = htons(PORT);
+    bind(sockfd, (struct sockaddr*)&serv, sizeof(serv));
+
+    printf("Waiting for nodes...\n");
+    while(node_count < MAX_NODES) {
+        socklen_t len = sizeof(cli); uint8_t buf[256];
+        int n = recvfrom(sockfd, buf, sizeof(buf), 0, (struct sockaddr*)&cli, &len);
+        if(n>0 && (buf[0]&0x0F)==MSG_REGISTER) {
+            uint8_t id = buf[1];
+            int known=0;
+            for(int i=0;i<node_count;i++) if(nodes[i].node_id==id) known=1;
+            if(!known) {
+                nodes[node_count].node_id = id;
+                nodes[node_count].addr = cli;
+                nodes[node_count].rx = ((id-1)%2)*NODE_WIDTH;
+                nodes[node_count].ry = ((id-1)/2)*NODE_HEIGHT;
+                send_ack(sockfd, &cli);
+                
+                uint8_t as[32]; pack_header(as, MSG_ASSIGN, id, 6);
+                as[4]=nodes[node_count].rx; as[5]=nodes[node_count].ry;
+                as[6]=NODE_WIDTH; as[7]=NODE_HEIGHT; as[8]=ls.angle;
+                as[9]=alp_crc(as, 9);
+                sendto(sockfd, as, 10, 0, (struct sockaddr*)&cli, len);
+                printf("Node %d Reg. Region %d,%d. Port %d\n", id, nodes[node_count].rx, nodes[node_count].ry, ntohs(cli.sin_port));
+                node_count++;
+            }
+        }
+    }
+    sleep(1);
+
+    // --- SIMULATION ---
+    double cx=19.5, cy=25.0, ca=0; // Start Center Up
+    int str_idx = 0;
+    int total = strlen(final_str);
+    int curr_node = get_node_idx((int)cx, (int)cy);
+
+    printf("Starting Stream...\n");
+    struct timeval tv = {0, 400000}; // INCREASED TIMEOUT TO 400ms
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+
+    while(str_idx < total) {
+        int chunk = 50; 
+        if(str_idx + chunk > total) chunk = total - str_idx;
+        
+        // Handle OOB
+        if(curr_node == -1) {
+            printf("WARN: Turtle OOB at %.1f,%.1f. Simulating blindly.\n", cx, cy);
+            for(int k=0; k<chunk; k++) {
+                char c = final_str[str_idx+k];
+                if(c=='F') {
+                    cx += my_cos(ca * MY_PI/180.0);
+                    cy += my_sin(ca * MY_PI/180.0);
+                } else if(c=='+') ca += ls.angle;
+                else if(c=='-') ca -= ls.angle;
+            }
+            str_idx += chunk;
+            curr_node = get_node_idx((int)cx, (int)cy);
+            continue; 
+        }
+
+        uint8_t pkt[256];
+        pack_header(pkt, MSG_DATA, nodes[curr_node].node_id, 12 + chunk);
+        float fx=(float)cx; float fy=(float)cy; float fa=(float)ca;
+        memcpy(&pkt[4], &fx, 4); memcpy(&pkt[8], &fy, 4); memcpy(&pkt[12], &fa, 4);
+        memcpy(&pkt[16], &final_str[str_idx], chunk);
+        pkt[4+12+chunk] = alp_crc(pkt, 4+12+chunk);
+
+        int success = 0;
+        for(int r=0; r<5; r++) { 
+            // Debug print
+            printf("Sending to Node %d (Attempt %d)...\n", nodes[curr_node].node_id, r+1);
+            
+            sendto(sockfd, pkt, 5+12+chunk, 0, (struct sockaddr*)&nodes[curr_node].addr, sizeof(nodes[curr_node].addr));
+            
+            uint8_t resp[256]; socklen_t l = sizeof(cli);
+            int n = recvfrom(sockfd, resp, sizeof(resp), 0, (struct sockaddr*)&cli, &l);
+            
+            if(n>0) {
+                int type = resp[0] & 0x0F;
+                if(type == MSG_HANDOVER) {
+                    nodes[curr_node].addr = cli;
+                    float nx, ny, na; uint16_t proc;
+                    memcpy(&nx, &resp[4], 4); memcpy(&ny, &resp[8], 4); memcpy(&na, &resp[12], 4);
+                    proc = (resp[16]<<8) | resp[17];
+                    
+                    printf("Handover Node %d -> %.1f,%.1f. Processed %d\n", nodes[curr_node].node_id, nx, ny, proc);
+                    cx=nx; cy=ny; ca=na;
+                    str_idx += proc;
+                    curr_node = get_node_idx((int)cx, (int)cy);
+                    success = 1;
+                    send_ack(sockfd, &cli);
+                    
+                    // IMPORTANT: SLEEP TO LET NETWORK SETTLE
+                    usleep(50000); 
+                    break;
+                }
+                else if(type == MSG_ACK) {
+                    for(int k=0; k<chunk; k++) {
+                        char c = final_str[str_idx+k];
+                        if(c=='F') {
+                            cx += my_cos(ca * MY_PI/180.0);
+                            cy += my_sin(ca * MY_PI/180.0);
+                        } 
+                        else if(c=='+') ca += ls.angle;
+                        else if(c=='-') ca -= ls.angle;
+                    }
+                    str_idx += chunk;
+                    success = 1; 
+                    printf("Node %d ACKed.\n", nodes[curr_node].node_id);
+                    break;
+                }
+            }
+        }
+        if(!success) { 
+            printf("Timeout Node %d. Skipping chunk.\n", nodes[curr_node].node_id); 
+            str_idx+=chunk; 
+        }
     }
 
-    printf("=== SERVER STARTED (Reliable ALP) ===\n");
-    printf("Waiting for %d nodes to register...\n", MAX_NODES);
-
-    struct timeval tv_zero = {0, 0};
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv_zero, sizeof tv_zero);
-
-    while (node_count < MAX_NODES) {
-        socklen_t len = sizeof(cliaddr);
-        uint8_t buffer[256];
-        int n = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&cliaddr, &len);
-        if (n > 0) {
-            int type = buffer[0] & 0x0F;
-            if (type == MSG_REGISTER) {
-                uint8_t nid = buffer[1];
-                int exists = 0;
-                for(int i=0; i<node_count; i++) if(nodes[i].node_id == nid) exists=1;
-                if(!exists) {
-                    nodes[node_count].node_id = nid;
-                    nodes[node_count].addr = cliaddr;
-                    nodes[node_count].active = 1;
-                    send_ack(sockfd, &cliaddr);
-                    send_assign(&ls, sockfd, &nodes[node_count], node_count);
-                    node_count++;
-                    printf("Node %d registered.\n", nid);
+    // --- COLLECTION ---
+    printf("Collecting...\n");
+    for(int i=0; i<node_count; i++) {
+        int sx = nodes[i].rx; int sy = nodes[i].ry;
+        for(int r=0; r<NODE_HEIGHT; r++) {
+            uint8_t rq[8]; pack_header(rq, MSG_REQUEST, nodes[i].node_id, 1);
+            rq[4]=r; rq[5]=alp_crc(rq, 5);
+            
+            for(int try=0; try<5; try++) {
+                sendto(sockfd, rq, 6, 0, (struct sockaddr*)&nodes[i].addr, sizeof(nodes[i].addr));
+                uint8_t rb[64]; socklen_t l=sizeof(cli);
+                if(recvfrom(sockfd, rb, sizeof(rb), 0, (struct sockaddr*)&cli, &l) > 0) {
+                    if((rb[0]&0x0F)==MSG_RESPONSE) {
+                         memcpy(&global_grid[sy+r][sx], &rb[4], NODE_WIDTH);
+                         break;
+                    }
                 }
             }
         }
     }
 
-    double start_x = 20.0, start_y = 20.0;
-    int start_node_idx = get_region_for_point(start_x, start_y);
-    printf("\n>>> STARTING SIMULATION <<<\n");
-    if(start_node_idx >= 0)
-        send_work_chunk(sockfd, start_node_idx, final_word, 0, start_x, start_y, 0.0);
-
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv_zero, sizeof tv_zero);
-
-    while (1) {
-        socklen_t len = sizeof(cliaddr);
-        uint8_t buffer[1024];
-        int n = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&cliaddr, &len);
-        if (n <= 0) continue;
-
-        int type = buffer[0] & 0x0F;
-
-        if (type == MSG_HANDOVER) {
-            send_ack(sockfd, &cliaddr);
-
-            // === POPRAWKA TUTAJ: Indeksy przesunięte o 2 w lewo! ===
-            // Header (4 bajty) -> Payload zaczyna się od buffer[4]
-            int idx = (buffer[4] << 8) | buffer[5];
-            double h_x, h_y, h_ang;
-            memcpy(&h_x, &buffer[6], 8);
-            memcpy(&h_y, &buffer[14], 8);
-            memcpy(&h_ang, &buffer[22], 8);
-
-            printf("HANDOVER (Idx %d) at (%.2f, %.2f)\n", idx, h_x, h_y);
-
-            if (idx >= strlen(final_word)) {
-                printf("DRAWING FINISHED!\n");
-                break; 
-            }
-
-            int next_node = get_region_for_point(h_x, h_y);
-            if (next_node == -1) {
-                printf("Turtle escaped!\n");
-                break;
-            }
-            send_work_chunk(sockfd, next_node, final_word, idx, h_x, h_y, h_ang);
-        }
+    printf("\n=== RESULT ===\n");
+    for(int y=0; y<GRID_HEIGHT; y++) {
+        for(int x=0; x<GRID_WIDTH; x++) putchar(global_grid[y][x]);
+        putchar('\n');
     }
-
-    printf("\n>>> REQUESTING FINAL IMAGES <<<\n");
-    for (int i = 0; i < node_count; i++) {
-        uint8_t buf[16];
-        pack_header(buf, MSG_REQUEST, nodes[i].node_id, 0);
-        buf[4] = alp_crc(buf, 4);
-        send_reliable(sockfd, buf, 5, &nodes[i].addr);
-    }
-
-    printf("Collecting data...\n");
-    struct timeval tv_poll = {0, 100000};
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv_poll, sizeof tv_poll);
-
-    int received_count = 0;
-    while(received_count < 60) { 
-        socklen_t len = sizeof(cliaddr);
-        uint8_t buf[2048];
-        int n = recvfrom(sockfd, buf, sizeof(buf), 0, (struct sockaddr *)&cliaddr, &len);
-        if(n > 0) {
-            int type = buf[0] & 0x0F;
-            if (type == MSG_RESPONSE) {
-                send_ack(sockfd, &cliaddr); 
-                uint8_t node_id = buf[1];
-                int region_idx = -1;
-                for(int i=0; i<node_count; i++) if(nodes[i].node_id == node_id) region_idx = i;
-                if(region_idx != -1) {
-                     int start_x = (region_idx % 2) * 20;
-                     int start_y = (region_idx / 2) * 20;
-                     int ptr = 4;
-                     printf("Merged data from Node %d.\n", node_id);
-                     for(int y=0; y<20; y++) {
-                        for(int x=0; x<20; x++) {
-                            char val = buf[ptr++];
-                            if(val == '#') global_grid[start_y + y][start_x + x] = '#';
-                        }
-                     }
-                }
-            }
-        }
-        received_count++;
-    }
-
-    printf("\n================ FINAL RESULT ================\n");
-    for(int y = 0; y < GRID_HEIGHT; y++) {
-        for(int x = 0; x < GRID_WIDTH; x++) {
-            printf("%c", global_grid[y][x]);
-        }
-        printf("\n");
-    }
-    printf("==============================================\n");
     return 0;
 }

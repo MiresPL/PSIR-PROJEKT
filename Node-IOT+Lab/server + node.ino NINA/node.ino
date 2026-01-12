@@ -11,12 +11,14 @@
 #define MSG_REQUEST  0x5
 #define MSG_RESPONSE 0x6
 #define MSG_HANDOVER 0x7
+#define MSG_REQ_COORDS  0x8
+#define MSG_RESP_COORDS 0x9
 
 // ============================================
 // !!! IP TWOJEGO SERVERA (UPEWNIJ SIE ZE DOBRE) !!!
-#define SERVER_IP ZsutIPAddress(192,168,56,104) 
+#define SERVER_IP ZsutIPAddress(192,168,89,10) 
 // Ustaw odpowiednie ID dla każdego pliku hex (1, 2, 3, 4)
-#define NODE_ID 4
+#define NODE_ID 1
 // ============================================
 
 #define SERVER_PORT 8000
@@ -43,6 +45,15 @@ void pack_header(uint8_t *buf, int type, uint8_t seq, int payload_len){
     buf[1] = seq; buf[2] = NODE_ID;
     buf[3] = (payload_len >> 8) & 0xFF; buf[4] = payload_len & 0xFF;
 }
+
+uint16_t readTemperature() {
+    return ZsutAnalog5Read();
+}
+
+uint16_t readHumidity() {
+    return ZsutAnalog1Read();
+}
+
 
 void setup(){
     Serial.begin(9600);
@@ -146,6 +157,36 @@ void loop(){
             r[11]=alp_crc(r,11);
             
             Udp.beginPacket(SERVER_IP, SERVER_PORT); Udp.write(r,12); Udp.endPacket();
+        }
+        else if(type == MSG_REQ_COORDS){
+            Serial.println("REQ: Origin Coords requested.");
+            
+            // 1. Odczytujemy sensory
+            // Z5 -> Temperatura -> Współrzędna X
+            // Z1 -> Wilgotność  -> Współrzędna Y
+            uint16_t raw_temp = readTemperature(); 
+            uint16_t raw_hum  = readHumidity();
+
+            // 2. Budujemy odpowiedź
+            // Payload 4 bajty: [T_H, T_L, H_H, H_L]
+            uint8_t resp[16];
+            pack_header(resp, MSG_RESP_COORDS, seq, 4);
+
+            resp[5] = (raw_temp >> 8) & 0xFF;
+            resp[6] = raw_temp & 0xFF;
+            resp[7] = (raw_hum >> 8) & 0xFF;
+            resp[8] = raw_hum & 0xFF;
+
+            // CRC całości (nagłówek + 4 bajty danych)
+            resp[9] = alp_crc(resp, 9);
+
+            // 3. Wysyłamy
+            Udp.beginPacket(SERVER_IP, SERVER_PORT);
+            Udp.write(resp, 10);
+            Udp.endPacket();
+            
+            Serial.print("SENT: T="); Serial.print(raw_temp);
+            Serial.print(" H="); Serial.println(raw_hum);
         }
         else if(type == MSG_REQUEST){
             // Dla pewności odsyłamy ACK zanim wyślemy dane (opcjonalne, ale zgodne z protokołem)

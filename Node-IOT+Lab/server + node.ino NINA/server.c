@@ -6,7 +6,6 @@
 #include <arpa/inet.h>
 #include <sys/time.h>
 #include <stdint.h>
-#include <math.h>
 #include <errno.h>
 #include <fcntl.h>
 
@@ -15,11 +14,12 @@
 #define NODE_COUNT 4
 #define GRID_SIZE 40        
 #define NODE_GRID_SIZE 20   
-#define CHUNK_SIZE 1       // 1 znak na raz dla precyzji (można zwiększyć)
-#define MAX_RETRIES 20      // Było 5 -> dajmy 20
-#define TIMEOUT_USEC 500000 // 300ms timeout
+#define CHUNK_SIZE 10       // 1 znak na raz dla precyzji (można zwiększyć)
+#define MAX_RETRIES 30      // Było 5 -> dajmy 20
+#define TIMEOUT_USEC 1000000 // 300ms timeout
 
 #define MAX_L_SYSTEM_SIZE 1000000 
+#define MY_PI 3.14159265358979323846
 
 #define ALP_VERSION 1
 #define MSG_REGISTER 0x1
@@ -29,6 +29,10 @@
 #define MSG_REQUEST  0x5
 #define MSG_RESPONSE 0x6
 #define MSG_HANDOVER 0x7
+#define MSG_REQ_COORDS  0x8
+#define MSG_RESP_COORDS 0x9
+
+#define ORIGIN_NODE_ID 1
 
 typedef struct {
     uint8_t id;             
@@ -130,6 +134,53 @@ int get_node_index(double x, double y) {
     if (col < 0) col = 0; if (col > 1) col = 1;
     if (row < 0) row = 0; if (row > 1) row = 1;
     return row * 2 + col;
+}
+
+void fetch_origin_coordinates(int sock) {
+    int node_idx = get_node_index(config.start_x, config.start_y);
+    
+    if(nodes[node_idx].active == 0) {
+        printf("WARN: Origin Node (Index %d) determined from config is NOT active! Using defaults.\n", node_idx);
+        return;
+    }
+
+    int target_id = nodes[node_idx].id;
+    printf("Config start=(%.1f, %.1f). Selected Origin Node: %d\n", 
+           config.start_x, config.start_y, target_id);
+    
+    printf("Fetching sensor data from Node %d...\n", target_id);
+
+    uint8_t req[6];
+    uint8_t buf[256];
+    global_seq++;
+
+    // Budujemy pakiet żądania MSG_REQ_COORDS (0x8)
+    pack_header(req, MSG_REQ_COORDS, global_seq, target_id, 0);
+    req[5] = calc_crc(req, 5); 
+
+    // Wysyłamy do wyliczonego node_idx
+    int n = send_reliable(sock, node_idx, req, 6, MSG_RESP_COORDS, buf, sizeof(buf));
+
+    if (n > 0) {
+        // Payload: [TEMP_H, TEMP_L, HUM_H, HUM_L]
+        uint16_t raw_temp = (buf[5] << 8) | buf[6];
+        uint16_t raw_hum  = (buf[7] << 8) | buf[8];
+
+        printf("Received RAW sensor data: Temp=%d, Hum=%d\n", raw_temp, raw_hum);
+
+        // Nadpisujemy współrzędne startowe danymi z czujników
+        // Analog (0-1023) -> Grid (0.0 - 40.0)
+        config.start_x = ((double)raw_temp / 1023.0) * (double)GRID_SIZE;
+        config.start_y = ((double)raw_hum  / 1023.0) * (double)GRID_SIZE;
+
+        // Zabezpieczenie krawędzi
+        if(config.start_x >= GRID_SIZE) config.start_x = GRID_SIZE - 0.1;
+        if(config.start_y >= GRID_SIZE) config.start_y = GRID_SIZE - 0.1;
+
+        printf("UPDATED START COORDS from sensors: X=%.2f, Y=%.2f\n", config.start_x, config.start_y);
+    } else {
+        printf("ERROR: Failed to fetch coords from Origin Node %d. Keeping input.txt defaults.\n", target_id);
+    }
 }
 
 void load_config() {
@@ -391,6 +442,8 @@ int main() {
             printf("Node %d configured (ACK received).\n", nodes[i].id);
         }
     }
+
+    fetch_origin_coordinates(sock);
 
     generate_lsystem();
     run_simulation(sock);
